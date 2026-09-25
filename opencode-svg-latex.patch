@@ -1,0 +1,1159 @@
+From d2c31b4f5c1360111c406ad36ec6fb9ca1164228 Mon Sep 17 00:00:00 2001
+From: kaivalyamahajan009-code
+ <307739818+kaivalyamahajan009-code@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 03:16:58 +0530
+Subject: [PATCH] feat(app): render inline svg diagrams and fix latex
+ delimiters
+
+SVG diagrams
+- Fenced ```svg blocks in assistant messages render as inline diagrams.
+- While the fence is still streaming, a loading card shows the opencode
+  progress indicator next to the diagram's <title>.
+- Diagrams are shown through <img>, so scripts and remote resources never
+  run; event handlers, <script>, foreignObject and unsafe hrefs are also
+  stripped from the source. Invalid SVG falls back to the code.
+- When OPENCODE_CLIENT=desktop, the system prompt tells the model it may
+  answer with ```svg diagrams.
+
+LaTeX
+- Support \[ ... \] display math, including mid-sentence, instead of
+  letting marked's escape rule turn it into literal brackets.
+- Allow \( ... \) to wrap across lines and $$ ... $$ on a single line.
+- Math never spans a blank line, so an unclosed delimiter can't swallow
+  the rest of a streaming response.
+- The streaming block splitter now uses the same block-math rules, so
+  display math containing lines like "+ &" or "- &" is no longer torn
+  apart into list items.
+---
+ packages/opencode/src/session/prompt.ts       |   2 +
+ packages/opencode/src/session/system.ts       |  15 ++
+ packages/opencode/test/session/system.test.ts |   6 +
+ .../src/components/markdown-stream.test.ts    |   8 +
+ .../src/components/markdown-stream.ts         |   6 +-
+ .../components/markdown-svg-source.test.ts    |  39 +++++
+ .../src/components/markdown-svg-source.ts     | 139 +++++++++++++++
+ .../src/components/markdown-svg.tsx           | 161 ++++++++++++++++++
+ .../session-ui/src/components/markdown.css    |  76 +++++++++
+ .../src/components/markdown.stories.tsx       |  84 +++++++++
+ .../session-ui/src/components/markdown.tsx    | 132 ++++++++++++--
+ packages/ui/src/context/marked-parser.test.ts |  62 +++++++
+ packages/ui/src/context/marked-parser.tsx     |  98 ++++++++---
+ 13 files changed, 792 insertions(+), 36 deletions(-)
+ create mode 100644 packages/session-ui/src/components/markdown-svg-source.test.ts
+ create mode 100644 packages/session-ui/src/components/markdown-svg-source.ts
+ create mode 100644 packages/session-ui/src/components/markdown-svg.tsx
+
+diff --git a/packages/opencode/src/session/prompt.ts b/packages/opencode/src/session/prompt.ts
+index 0f85d44..5178750 100644
+--- a/packages/opencode/src/session/prompt.ts
++++ b/packages/opencode/src/session/prompt.ts
+@@ -1261,8 +1261,10 @@ const layer = Layer.effect(
+               sys.mcp(agent, session.permission),
+               MessageV2.toModelMessagesEffect(msgs, model),
+             ])
++            const surface = SystemPrompt.surface(flags.client)
+             const system = [
+               ...env,
++              ...(surface ? [surface] : []),
+               ...instructions,
+               ...(mcpInstructions ? [mcpInstructions] : []),
+               ...(skills ? [skills] : []),
+diff --git a/packages/opencode/src/session/system.ts b/packages/opencode/src/session/system.ts
+index 61ab74d..e113749 100644
+--- a/packages/opencode/src/session/system.ts
++++ b/packages/opencode/src/session/system.ts
+@@ -50,6 +50,21 @@ export function provider(model: Provider.Model) {
+   return [PROMPT_DEFAULT]
+ }
+ 
++const DESKTOP_SURFACE = [
++  "The user is viewing this session in the opencode desktop app, which renders fenced ```svg code blocks as inline diagrams.",
++  "When a picture explains something better than prose (diagrams, flowcharts, circuits, geometry, plots, architecture sketches), you may include one:",
++  "- Emit one self-contained <svg> element with a viewBox inside a ```svg fence. Put a short <title> first; it is shown while the diagram is being drawn.",
++  "- It is displayed on the app background, which may be light or dark. Use explicit fill and stroke colors that read on both, or currentColor for text and lines that should follow the theme.",
++  "- Scripts, event handlers, external images, links and web fonts are stripped.",
++  "- Do not use SVG for anything text, lists, tables or code express just as well.",
++].join("\n")
++
++/** Instructions that depend on which client renders the transcript (`OPENCODE_CLIENT`). */
++export function surface(client: string) {
++  if (client === "desktop") return DESKTOP_SURFACE
++  return undefined
++}
++
+ export interface Interface {
+   readonly environment: (model: Provider.Model) => Effect.Effect<string[]>
+   readonly skills: (agent: Agent.Info) => Effect.Effect<string | undefined>
+diff --git a/packages/opencode/test/session/system.test.ts b/packages/opencode/test/session/system.test.ts
+index 09bac3f..3b7e595 100644
+--- a/packages/opencode/test/session/system.test.ts
++++ b/packages/opencode/test/session/system.test.ts
+@@ -84,6 +84,12 @@ const it = testEffect(
+ )
+ 
+ describe("session.system", () => {
++  test("only tells the model about inline svg diagrams when the desktop app renders them", () => {
++    expect(SystemPrompt.surface("desktop")).toContain("```svg")
++    expect(SystemPrompt.surface("cli")).toBeUndefined()
++    expect(SystemPrompt.surface("acp")).toBeUndefined()
++  })
++
+   test("selects the Meta prompt for Muse Spark model IDs", () => {
+     for (const id of ["meta/muse-spark-preview", "muse-spark-1.1", "muse-spark-1.2"]) {
+       const prompt = SystemPrompt.provider({ api: { id } } as Provider.Model)[0]
+diff --git a/packages/session-ui/src/components/markdown-stream.test.ts b/packages/session-ui/src/components/markdown-stream.test.ts
+index baa0803..fe4ad7e 100644
+--- a/packages/session-ui/src/components/markdown-stream.test.ts
++++ b/packages/session-ui/src/components/markdown-stream.test.ts
+@@ -14,6 +14,14 @@ describe("markdown stream", () => {
+     ])
+   })
+ 
++  test("keeps a display math block whole when its lines look like list items", () => {
++    const math = "$$\n\\begin{array}{cc}\n+ & a \\\\\n- & b\n\\end{array}\n$$\n\n"
++    const blocks = stream(`intro\n\n${math}after`, true)
++    expect(blocks.map((block) => block.raw)).toEqual(["intro\n\n", math, "after"])
++    const done = project(project(undefined, `intro\n\n${math}after`, true), `intro\n\n${math}after`, false)
++    expect(done.blocks.map((block) => block.raw)).toEqual(["intro\n\n", math, "after"])
++  })
++
+   test("splits an unfinished trailing code fence from stable content", () => {
+     expect(stream("before\n\n```ts\nconst x = 1", true)).toEqual([
+       { raw: "before\n\n", src: "before\n\n", mode: "full" },
+diff --git a/packages/session-ui/src/components/markdown-stream.ts b/packages/session-ui/src/components/markdown-stream.ts
+index 18cf415..bef1de7 100644
+--- a/packages/session-ui/src/components/markdown-stream.ts
++++ b/packages/session-ui/src/components/markdown-stream.ts
+@@ -1,7 +1,11 @@
+-import { marked, type Tokens } from "marked"
++import { Marked, type Tokens } from "marked"
+ import remend from "remend"
++import { mathBlockExtension } from "@opencode-ai/ui/context/marked-parser"
+ import { completedProjection } from "./markdown-projection"
+ 
++// Block splitting must agree with the renderer on where display math starts and ends.
++const marked = new Marked(mathBlockExtension)
++
+ export type Block = {
+   raw: string
+   src: string
+diff --git a/packages/session-ui/src/components/markdown-svg-source.test.ts b/packages/session-ui/src/components/markdown-svg-source.test.ts
+new file mode 100644
+index 0000000..a7f9f5c
+--- /dev/null
++++ b/packages/session-ui/src/components/markdown-svg-source.test.ts
+@@ -0,0 +1,39 @@
++import { describe, expect, test } from "bun:test"
++import { isSvgLanguage, normalizeSvgSource, svgTitle } from "./markdown-svg-source"
++
++describe("markdown svg", () => {
++  test("recognises svg fences regardless of case or padding", () => {
++    expect(isSvgLanguage("svg")).toBe(true)
++    expect(isSvgLanguage(" SVG ")).toBe(true)
++    expect(isSvgLanguage("xml")).toBe(false)
++    expect(isSvgLanguage(undefined)).toBe(false)
++  })
++
++  test("reads the title while the rest of the diagram is still streaming", () => {
++    expect(svgTitle('<svg viewBox="0 0 10 10"><title>Double slit &amp; screen</title><rect')).toBe(
++      "Double slit & screen",
++    )
++    expect(svgTitle('<svg viewBox="0 0 10 10"><title>Unfinished')).toBeUndefined()
++    expect(svgTitle("<svg><title>  spaced\n  out </title></svg>")).toBe("spaced out")
++  })
++
++  test("adds the namespaces a standalone svg document needs", () => {
++    expect(normalizeSvgSource('<svg viewBox="0 0 1 1"></svg>')).toBe(
++      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"></svg>',
++    )
++    expect(normalizeSvgSource('<svg xmlns="http://www.w3.org/2000/svg"><use xlink:href="#a"/></svg>')).toBe(
++      '<svg xmlns:xlink="http://www.w3.org/1999/xlink" xmlns="http://www.w3.org/2000/svg"><use xlink:href="#a"/></svg>',
++    )
++  })
++
++  test("leaves an already valid document untouched", () => {
++    const source = '<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"/>'
++    expect(normalizeSvgSource(source)).toBe(source)
++  })
++
++  test("rewrites html entities that xml does not define", () => {
++    expect(normalizeSvgSource('<svg xmlns="x"><text>a&nbsp;&rarr;&mdash;b &amp; &Omega;</text></svg>')).toBe(
++      '<svg xmlns="x"><text>a&#160;&#8594;&#8212;b &amp; &Omega;</text></svg>',
++    )
++  })
++})
+diff --git a/packages/session-ui/src/components/markdown-svg-source.ts b/packages/session-ui/src/components/markdown-svg-source.ts
+new file mode 100644
+index 0000000..7452a29
+--- /dev/null
++++ b/packages/session-ui/src/components/markdown-svg-source.ts
+@@ -0,0 +1,139 @@
++const SVG_NS = "http://www.w3.org/2000/svg"
++const XLINK_NS = "http://www.w3.org/1999/xlink"
++const MAX_SOURCE_LENGTH = 1_000_000
++
++// Elements that can execute code or embed foreign documents. The diagram is rendered through
++// <img>, which already refuses to run them, but the source is also what users copy.
++const BLOCKED_ELEMENTS = new Set(["script", "foreignobject", "iframe", "object", "embed", "audio", "video"])
++
++// HTML named entities models routinely emit. They are not defined in XML, so a single `&nbsp;`
++// would otherwise make the whole diagram fail to parse.
++const HTML_ENTITIES: Record<string, string> = {
++  nbsp: "#160",
++  ndash: "#8211",
++  mdash: "#8212",
++  hellip: "#8230",
++  times: "#215",
++  divide: "#247",
++  deg: "#176",
++  middot: "#183",
++  bull: "#8226",
++  larr: "#8592",
++  uarr: "#8593",
++  rarr: "#8594",
++  darr: "#8595",
++  harr: "#8596",
++  plusmn: "#177",
++  le: "#8804",
++  ge: "#8805",
++  ne: "#8800",
++  micro: "#181",
++  copy: "#169",
++}
++
++export function isSvgLanguage(language: string | undefined) {
++  return language?.trim().toLowerCase() === "svg"
++}
++
++function decodeText(text: string) {
++  return text
++    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) => String.fromCodePoint(Number.parseInt(hex, 16)))
++    .replace(/&#(\d+);/g, (_, dec: string) => String.fromCodePoint(Number(dec)))
++    .replace(/&lt;/g, "<")
++    .replace(/&gt;/g, ">")
++    .replace(/&quot;/g, '"')
++    .replace(/&apos;/g, "'")
++    .replace(/&amp;/g, "&")
++}
++
++/** The first `<title>`, readable as soon as it has streamed in, so the loader can say what is being drawn. */
++export function svgTitle(source: string) {
++  const text = source
++    .match(/<title\b[^>]*>([^<]{1,200})<\/title>/i)?.[1]
++    ?.replace(/\s+/g, " ")
++    .trim()
++  if (!text) return undefined
++  return decodeText(text)
++}
++
++/** String-level repairs so typical model output parses as a standalone SVG document. */
++export function normalizeSvgSource(source: string) {
++  const text = source.trim().replace(/&([a-z]+);/gi, (entity, name: string) => {
++    const code = HTML_ENTITIES[name.toLowerCase()]
++    return code ? `&${code};` : entity
++  })
++  const open = text.match(/<svg\b[^>]*>/i)
++  if (!open || open.index === undefined) return text
++  let tag = open[0]
++  if (!/\sxmlns\s*=/.test(tag)) tag = tag.replace(/^<svg\b/i, `<svg xmlns="${SVG_NS}"`)
++  if (/\bxlink:/.test(text) && !/\sxmlns:xlink\s*=/.test(tag))
++    tag = tag.replace(/^<svg\b/i, `<svg xmlns:xlink="${XLINK_NS}"`)
++  return text.slice(0, open.index) + tag + text.slice(open.index + open[0].length)
++}
++
++function safeHref(value: string) {
++  const href = value.trim()
++  return href.startsWith("#") || /^data:image\/(?:png|jpe?g|gif|webp);/i.test(href)
++}
++
++function length(value: string | null) {
++  const match = value?.match(/^\s*(\d+(?:\.\d+)?)\s*(?:px)?\s*$/)
++  if (!match) return undefined
++  const result = Number(match[1])
++  return result > 0 ? result : undefined
++}
++
++export type PreparedSvg = {
++  url: string
++  width?: number
++  height?: number
++  title?: string
++}
++
++/**
++ * Validates, strips and sizes an SVG so it can be shown through `<img>`. An image context never
++ * runs scripts or fetches remote resources, and keeps the diagram's `<style>` and ids from
++ * leaking into (or colliding with) the rest of the transcript.
++ */
++export function prepareSvg(source: string, color?: string): PreparedSvg | undefined {
++  if (!source.trim() || source.length > MAX_SOURCE_LENGTH) return undefined
++  if (typeof DOMParser === "undefined" || typeof XMLSerializer === "undefined") return undefined
++
++  const doc = new DOMParser().parseFromString(normalizeSvgSource(source), "image/svg+xml")
++  const root = doc.documentElement
++  if (!root || root.namespaceURI !== SVG_NS || root.localName !== "svg") return undefined
++  if (doc.getElementsByTagNameNS("*", "parsererror").length > 0) return undefined
++
++  for (const element of [root, ...Array.from(root.querySelectorAll("*"))]) {
++    if (BLOCKED_ELEMENTS.has(element.localName.toLowerCase())) {
++      element.remove()
++      continue
++    }
++    for (const attribute of Array.from(element.attributes)) {
++      const name = attribute.name.toLowerCase()
++      if (name.startsWith("on")) element.removeAttributeNode(attribute)
++      else if ((name === "href" || name === "xlink:href") && !safeHref(attribute.value))
++        element.removeAttributeNode(attribute)
++    }
++  }
++
++  // <img> needs an absolute size; percentage or missing dimensions fall back to the viewBox.
++  const [, , boxWidth = 0, boxHeight = 0, ...rest] = (root.getAttribute("viewBox") ?? "")
++    .trim()
++    .split(/[\s,]+/)
++    .map(Number)
++  const validBox = rest.length === 0 && boxWidth > 0 && boxHeight > 0
++  const viewWidth = validBox ? boxWidth : undefined
++  const viewHeight = validBox ? boxHeight : undefined
++  const width = length(root.getAttribute("width")) ?? viewWidth
++  const height = length(root.getAttribute("height")) ?? viewHeight
++  if (width && length(root.getAttribute("width")) === undefined) root.setAttribute("width", String(width))
++  if (height && length(root.getAttribute("height")) === undefined) root.setAttribute("height", String(height))
++
++  // Lets `currentColor` follow the transcript's text color even though the image is isolated.
++  if (color && !root.hasAttribute("color")) root.setAttribute("color", color)
++
++  const title = root.querySelector("title")?.textContent?.replace(/\s+/g, " ").trim() || undefined
++  const markup = new XMLSerializer().serializeToString(root)
++  return { url: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(markup)}`, width, height, title }
++}
+diff --git a/packages/session-ui/src/components/markdown-svg.tsx b/packages/session-ui/src/components/markdown-svg.tsx
+new file mode 100644
+index 0000000..9a95909
+--- /dev/null
++++ b/packages/session-ui/src/components/markdown-svg.tsx
+@@ -0,0 +1,161 @@
++import { createMemo, createSignal, onMount, Show, type Accessor, type Setter } from "solid-js"
++import { render } from "solid-js/web"
++import { Spinner } from "@opencode-ai/ui/spinner"
++import { TextShimmer } from "@opencode-ai/ui/text-shimmer"
++import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
++import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
++import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
++import { SessionProgressIndicatorV2 } from "../v2/components/session-progress-indicator-v2"
++import { prepareSvg, svgTitle } from "./markdown-svg-source"
++
++export type SvgLabels = {
++  copy: string
++  copied: string
++  loading: string
++  error: string
++  alt: string
++}
++
++export type SvgProps = {
++  source: string
++  complete: boolean
++  labels: SvgLabels
++}
++
++function MarkdownSvg(props: { state: Accessor<SvgProps> }) {
++  let frame: HTMLDivElement | undefined
++  const [color, setColor] = createSignal<string>()
++  const [copied, setCopied] = createSignal(false)
++  const newLayout = typeof document !== "undefined" && document.body.hasAttribute("data-new-layout")
++  const source = createMemo(() => props.state().source)
++  const complete = createMemo(() => props.state().complete)
++  const labels = () => props.state().labels
++  const title = createMemo(() => svgTitle(source()))
++  const prepared = createMemo(() => {
++    const value = color()
++    if (!complete() || value === undefined) return undefined
++    return prepareSvg(source(), value)
++  })
++  let reset: ReturnType<typeof setTimeout> | undefined
++
++  // The host is attached right after render(), so resolve the inherited colour on the next tick.
++  onMount(() => queueMicrotask(() => setColor((frame && getComputedStyle(frame).color) || "#888888")))
++
++  const copy = async () => {
++    const clipboard = typeof navigator === "undefined" ? undefined : navigator.clipboard
++    if (!clipboard) return
++    await clipboard.writeText(source())
++    setCopied(true)
++    if (reset) clearTimeout(reset)
++    reset = setTimeout(() => setCopied(false), 2000)
++  }
++
++  const copyButton = () => {
++    const label = () => (copied() ? labels().copied : labels().copy)
++    return (
++      <div data-slot="markdown-svg-copy" data-copied={copied() ? "true" : undefined}>
++        <TooltipV2 placement="top" value={label()}>
++          <IconButtonV2
++            type="button"
++            size="normal"
++            variant="ghost-muted"
++            aria-label={label()}
++            onClick={() => void copy()}
++            icon={<IconV2 name={copied() ? "check" : "outline-copy"} />}
++          />
++        </TooltipV2>
++      </div>
++    )
++  }
++
++  return (
++    <div ref={frame} data-slot="markdown-svg-frame">
++      <Show
++        when={complete()}
++        fallback={
++          <div data-slot="markdown-svg-loading" role="status" aria-live="polite">
++            <span data-slot="markdown-svg-spinner">
++              <Show when={newLayout} fallback={<Spinner />}>
++                <SessionProgressIndicatorV2 />
++              </Show>
++            </span>
++            <TextShimmer text={title() ?? labels().loading} />
++          </div>
++        }
++      >
++        <Show when={color() !== undefined}>
++          <Show
++            when={prepared()}
++            fallback={
++              <div data-slot="markdown-svg-error">
++                <div data-slot="markdown-svg-error-message">{labels().error}</div>
++                <pre class="shiki OpenCode">
++                  <code>{source()}</code>
++                </pre>
++                {copyButton()}
++              </div>
++            }
++          >
++            {(svg) => (
++              <figure data-slot="markdown-svg-figure">
++                <img
++                  data-slot="markdown-svg-image"
++                  src={svg().url}
++                  alt={svg().title ?? title() ?? labels().alt}
++                  width={svg().width}
++                  height={svg().height}
++                  draggable={false}
++                />
++                {copyButton()}
++              </figure>
++            )}
++          </Show>
++        </Show>
++      </Show>
++    </div>
++  )
++}
++
++type SvgHostState = {
++  set: Setter<SvgProps>
++  dispose: () => void
++}
++
++const svgHosts = new WeakMap<HTMLElement, SvgHostState>()
++
++export function createSvgHost() {
++  const host = document.createElement("div")
++  host.setAttribute("data-component", "markdown-svg")
++  return host
++}
++
++export function isSvgHost(node: Node): node is HTMLElement {
++  return node instanceof HTMLElement && node.getAttribute("data-component") === "markdown-svg"
++}
++
++/** Mounts the diagram into `host` on first call and updates it in place afterwards. */
++export function updateSvgHost(host: HTMLElement, props: SvgProps) {
++  const existing = svgHosts.get(host)
++  if (existing) {
++    existing.set(props)
++    return
++  }
++  const state: Partial<SvgHostState> = {}
++  state.dispose = render(() => {
++    const [value, set] = createSignal(props)
++    state.set = set
++    return <MarkdownSvg state={value} />
++  }, host)
++  svgHosts.set(host, state as SvgHostState)
++}
++
++export function disposeSvgHosts(root: Element) {
++  const hosts = [
++    ...(isSvgHost(root) ? [root] : []),
++    ...Array.from(root.querySelectorAll('[data-component="markdown-svg"]')).filter(isSvgHost),
++  ]
++  for (const host of hosts) {
++    svgHosts.get(host)?.dispose()
++    svgHosts.delete(host)
++  }
++}
+diff --git a/packages/session-ui/src/components/markdown.css b/packages/session-ui/src/components/markdown.css
+index 1be5136..6002926 100644
+--- a/packages/session-ui/src/components/markdown.css
++++ b/packages/session-ui/src/components/markdown.css
+@@ -227,6 +227,82 @@
+     display: inline-flex;
+   }
+ 
++  /* Inline ```svg diagrams */
++  [data-component="markdown-svg"] {
++    position: relative;
++    margin: 12px 0 24px;
++    direction: ltr;
++    unicode-bidi: isolate;
++  }
++
++  [data-slot="markdown-svg-figure"] {
++    position: relative;
++    display: flex;
++    justify-content: center;
++    margin: 0;
++  }
++
++  [data-slot="markdown-svg-image"] {
++    display: block;
++    max-width: 100%;
++    height: auto;
++    margin: 0;
++    border-radius: 0;
++    user-select: none;
++  }
++
++  [data-slot="markdown-svg-loading"] {
++    display: flex;
++    align-items: center;
++    justify-content: center;
++    gap: 8px;
++    min-height: 140px;
++    padding: 16px;
++    border-radius: 6px;
++    border: 0.5px solid var(--v2-border-border-base);
++    background: var(--color-background-stronger);
++    color: var(--v2-text-text-muted, var(--text-weak));
++    font-size: 13px;
++  }
++
++  [data-slot="markdown-svg-spinner"] {
++    display: inline-flex;
++    flex-shrink: 0;
++    color: var(--v2-text-text-base, currentColor);
++  }
++
++  [data-slot="markdown-svg-spinner"] [data-component="spinner"] {
++    width: 16px;
++  }
++
++  [data-slot="markdown-svg-error"] {
++    position: relative;
++  }
++
++  [data-slot="markdown-svg-error-message"] {
++    font-size: 12px;
++    color: var(--v2-text-text-muted, var(--text-weak));
++  }
++
++  [data-slot="markdown-svg-error"] pre {
++    margin: 6px 0 0;
++  }
++
++  [data-slot="markdown-svg-copy"] {
++    position: absolute;
++    top: 4px;
++    inset-inline-end: 4px;
++    opacity: 0;
++    transition: opacity 0.15s ease;
++    z-index: 1;
++  }
++
++  [data-component="markdown-svg"]:hover [data-slot="markdown-svg-copy"],
++  [data-slot="markdown-svg-copy"]:focus-within,
++  [data-slot="markdown-svg-copy"][data-copied="true"] {
++    opacity: 1;
++  }
++
+   pre {
+     margin-top: 12px;
+     margin-bottom: 24px;
+diff --git a/packages/session-ui/src/components/markdown.stories.tsx b/packages/session-ui/src/components/markdown.stories.tsx
+index c4f99dc..d3d6293 100644
+--- a/packages/session-ui/src/components/markdown.stories.tsx
++++ b/packages/session-ui/src/components/markdown.stories.tsx
+@@ -1,8 +1,65 @@
+ // @ts-nocheck
++import { createSignal, onCleanup, onMount } from "solid-js"
+ import * as mod from "./markdown"
+ import { create } from "@opencode-ai/ui/storybook/scaffold"
+ import { markdown } from "@opencode-ai/ui/storybook/fixtures"
+ 
++const flowchart = [
++  '<svg viewBox="0 0 640 300" xmlns="http://www.w3.org/2000/svg">',
++  "  <title>Debug loop flowchart</title>",
++  "  <style>",
++  "    text { font: 500 15px system-ui, sans-serif; text-anchor: middle; dominant-baseline: middle; }",
++  "    .sub { font-size: 12px; font-weight: 400; }",
++  "    .label { font-size: 13px; fill: #c9c7c0; }",
++  "  </style>",
++  "  <defs>",
++  '    <marker id="gray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#8a8984"/></marker>',
++  '    <marker id="green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#34d399"/></marker>',
++  '    <marker id="orange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#f97316"/></marker>',
++  "  </defs>",
++  '  <rect x="250" y="20" width="140" height="44" rx="8" fill="#45443f" stroke="#6b6a64"/>',
++  '  <text x="320" y="42" fill="#e8e6df">Start</text>',
++  '  <line x1="320" y1="64" x2="320" y2="104" stroke="#8a8984" stroke-width="1.5" marker-end="url(#gray)"/>',
++  '  <rect x="215" y="106" width="210" height="60" rx="8" fill="#0b4a8b" stroke="#3b82f6"/>',
++  '  <text x="320" y="128" fill="#e6f0ff">Is it working?</text>',
++  '  <text class="sub" x="320" y="150" fill="#9cc3ff">Check the result</text>',
++  '  <polyline points="215,136 110,136 110,222" fill="none" stroke="#34d399" stroke-width="1.5" marker-end="url(#green)"/>',
++  '  <text class="label" x="150" y="122">Yes</text>',
++  '  <rect x="40" y="224" width="140" height="48" rx="8" fill="#064e3b" stroke="#10b981"/>',
++  '  <text x="110" y="248" fill="#a7f3d0">Ship it</text>',
++  '  <polyline points="425,136 530,136 530,222" fill="none" stroke="#f97316" stroke-width="1.5" marker-end="url(#orange)"/>',
++  '  <text class="label" x="490" y="122">No</text>',
++  '  <rect x="460" y="224" width="140" height="48" rx="8" fill="#7c2d12" stroke="#f97316"/>',
++  '  <text x="530" y="248" fill="#fed7aa">Debug</text>',
++  '  <line x1="508" y1="224" x2="428" y2="158" stroke="#f97316" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#orange)"/>',
++  "</svg>",
++].join("\n")
++
++const diagram = [
++  "Here is the loop most debugging sessions follow:",
++  "",
++  "```svg",
++  flowchart,
++  "```",
++  "",
++  "The dashed line is the debug loop feeding back into the check.",
++].join("\n")
++
++function StreamingMarkdown() {
++  const [size, setSize] = createSignal(0)
++  onMount(() => {
++    const timer = setInterval(() => {
++      setSize((current) => {
++        const next = Math.min(diagram.length, current + 10)
++        if (next === diagram.length) clearInterval(timer)
++        return next
++      })
++    }, 70)
++    onCleanup(() => clearInterval(timer))
++  })
++  return <mod.Markdown text={diagram.slice(0, size())} streaming={size() < diagram.length} cacheKey="svg-stream" />
++}
++
+ const docs = `### Overview
+ Render sanitized Markdown with code blocks, inline code, and safe links.
+ 
+@@ -51,3 +108,30 @@ export default {
+ }
+ 
+ export const Basic = story.Basic
++
++/** A fenced ```svg block renders as an isolated inline diagram with a copy action. */
++export const Diagram = { args: { text: diagram } }
++
++/** While the fence is open the diagram shows the opencode loader and its <title>. */
++export const StreamingDiagram = { render: () => <StreamingMarkdown /> }
++
++/** Source that is not well-formed SVG falls back to the code with a notice. */
++export const InvalidDiagram = {
++  args: { text: 'Broken output:\n\n```svg\n<svg viewBox="0 0 10 10"><rect width="10"\n```\n' },
++}
++
++/** Scripts, event handlers and remote references are stripped before rendering. */
++export const UntrustedDiagram = {
++  args: {
++    text: [
++      "```svg",
++      '<svg viewBox="0 0 200 60" onload="alert(1)">',
++      "  <script>alert(2)</script>",
++      '  <image href="https://example.com/track.png" width="10" height="10"/>',
++      '  <a href="javascript:alert(3)"><rect width="200" height="60" rx="8" fill="#1f6feb"/></a>',
++      '  <text x="100" y="35" fill="#fff" text-anchor="middle" font-family="sans-serif">safe &amp; sound</text>',
++      "</svg>",
++      "```",
++    ].join("\n"),
++  },
++}
+diff --git a/packages/session-ui/src/components/markdown.tsx b/packages/session-ui/src/components/markdown.tsx
+index 95894ba..32ca641 100644
+--- a/packages/session-ui/src/components/markdown.tsx
++++ b/packages/session-ui/src/components/markdown.tsx
+@@ -32,6 +32,8 @@ import { markdownBlockKey, type MarkdownToken } from "./markdown-worker-protocol
+ import { shouldResetCodeTokens, type RenderedCodeState } from "./markdown-code-state"
+ import { getCachedMarkdown, sanitizeMarkdown, touchCachedMarkdown, type MarkdownCacheEntry } from "./markdown-cache"
+ import { inlineCodeKind } from "./markdown-inline-code-kind"
++import { createSvgHost, disposeSvgHosts, isSvgHost, updateSvgHost, type SvgLabels } from "./markdown-svg"
++import { isSvgLanguage } from "./markdown-svg-source"
+ 
+ type RenderedBlock =
+   | (MarkdownCacheEntry & { key: string; mode: Exclude<Block["mode"], "code"> })
+@@ -46,6 +48,25 @@ type RenderedBlock =
+       stable: MarkdownToken[]
+       unstable: MarkdownToken[]
+     }
++  | {
++      key: string
++      mode: "svg"
++      raw: string
++      hash: string
++      source: string
++      complete: boolean
++    }
++
++function svgBlock(key: string, block: Block): Extract<RenderedBlock, { mode: "svg" }> {
++  return {
++    key,
++    mode: "svg",
++    raw: block.raw,
++    hash: String(block.raw.length),
++    source: block.src,
++    complete: !!block.complete,
++  }
++}
+ 
+ type RenderResult = {
+   text: string
+@@ -92,6 +113,8 @@ type CopyLabels = {
+   copied: string
+ }
+ 
++type BlockLabels = CopyLabels & { svg: SvgLabels }
++
+ type CopyButtonState = {
+   setLabels: Setter<CopyLabels>
+   setCopied: Setter<boolean>
+@@ -176,6 +199,12 @@ function disposeCopyButtons(root: Element) {
+   hosts.forEach(disposeCopyButton)
+ }
+ 
++/** Disposes every Solid root mounted inside rendered markdown (copy buttons and diagrams). */
++function disposeWidgets(root: Element) {
++  disposeCopyButtons(root)
++  disposeSvgHosts(root)
++}
++
+ const shellLanguages = new Set(["bash", "sh", "shell", "zsh", "fish", "console", "terminal"])
+ 
+ function codeKind(language: string | undefined) {
+@@ -275,7 +304,30 @@ function markInlineCode(root: HTMLDivElement) {
+   }
+ }
+ 
+-function decorate(root: HTMLDivElement, labels: CopyLabels) {
++// Swaps parser-marked ```svg blocks for inert diagram hosts. They are mounted by hydrateSvgHosts
++// once the block is in the live DOM, so the throwaway trees built for morphdom never own a root.
++function markSvgBlocks(root: HTMLDivElement, live: boolean) {
++  for (const pre of Array.from(root.querySelectorAll("pre[data-markdown-svg]"))) {
++    const host = createSvgHost()
++    host.dataset.svgSource = pre.textContent ?? ""
++    if (live) host.dataset.svgLive = "true"
++    pre.replaceWith(host)
++  }
++}
++
++function hydrateSvgHosts(root: HTMLDivElement, labels: SvgLabels) {
++  root.querySelectorAll<HTMLElement>('[data-component="markdown-svg"][data-svg-source]').forEach((host) =>
++    updateSvgHost(host, {
++      source: host.dataset.svgSource ?? "",
++      // A fence inside a still-streaming block may not be closed yet.
++      complete: host.dataset.svgLive !== "true",
++      labels,
++    }),
++  )
++}
++
++function decorate(root: HTMLDivElement, labels: CopyLabels, live = false) {
++  markSvgBlocks(root, live)
+   const blocks = Array.from(root.querySelectorAll("pre"))
+   for (const block of blocks) {
+     ensureCodeWrapper(block, labels)
+@@ -326,7 +378,7 @@ function setupCodeCopy(root: HTMLDivElement, getLabels: () => CopyLabels) {
+     for (const timeout of timeouts.values()) {
+       clearTimeout(timeout)
+     }
+-    disposeCopyButtons(root)
++    disposeWidgets(root)
+   }
+ }
+ 
+@@ -433,6 +485,8 @@ export function Markdown(
+           const key = base ? `${base}:${index}:${block.mode}` : undefined
+           const blockKey = markdownBlockKey(owner, src.key, index, block.mode)
+ 
++          if (block.mode === "code" && isSvgLanguage(block.language)) return svgBlock(blockKey, block)
++
+           if (block.mode === "code") {
+             const cached = completedCode.get(blockKey)
+             if (block.complete && cached?.raw === block.raw) return cached
+@@ -500,14 +554,22 @@ export function Markdown(
+     if (!container) return
+     if (isServer) return
+     if (content.length === 0) {
+-      disposeCopyButtons(container)
++      disposeWidgets(container)
+       container.innerHTML = ""
+       return
+     }
+ 
+-    const labels = {
++    const image = i18n.t("ui.fileMedia.kind.image")
++    const labels: BlockLabels = {
+       copy: i18n.t("ui.message.copy"),
+       copied: i18n.t("ui.message.copied"),
++      svg: {
++        copy: i18n.t("ui.message.copy"),
++        copied: i18n.t("ui.message.copied"),
++        loading: i18n.t("ui.fileMedia.state.loading", { kind: image }),
++        error: i18n.t("ui.fileMedia.state.error", { kind: image }),
++        alt: i18n.t("ui.imagePreview.alt"),
++      },
+     }
+     const nextCodeKeys = new Set(content.filter((block) => block.mode === "code").map((block) => block.key))
+     activeCodeKeys.forEach((key) => {
+@@ -519,9 +581,10 @@ export function Markdown(
+     while (container.children.length > content.length) {
+       const child = container.lastElementChild
+       if (!child) break
+-      disposeCopyButtons(child)
++      disposeWidgets(child)
+       child.remove()
+     }
++    hydrateSvgHosts(container, labels.svg)
+     container
+       .querySelectorAll<HTMLElement>('[data-slot="markdown-copy-button"]')
+       .forEach((button) => setCopyState(button, labels, button.dataset.copied === "true"))
+@@ -564,10 +627,12 @@ function pendingBlocks(
+   const initial = result.blocks.length === 1 && result.blocks[0]?.key === "initial"
+   return projection.blocks.map((block, index) => {
+     const current = initial ? undefined : result.blocks[index]
+-    if (current && canReusePendingBlock(current, block)) return current
++    // Diagram placeholders are cheap and must carry the latest source, so they are never reused.
++    if (current && current.mode !== "svg" && canReusePendingBlock(current, block)) return current
+     const key = markdownBlockKey(owner, cacheKey, index, block.mode)
+     if (block.mode !== "code")
+       return { key, mode: block.mode, raw: block.raw, hash: String(block.raw.length), html: fallback(block.src) }
++    if (isSvgLanguage(block.language)) return svgBlock(key, block)
+     return {
+       key,
+       mode: block.mode,
+@@ -586,12 +651,16 @@ function disposeCode(key: string) {
+   disposeStreamingCode(key)
+ }
+ 
+-function updateBlock(container: HTMLDivElement, index: number, block: RenderedBlock, labels: CopyLabels) {
++function updateBlock(container: HTMLDivElement, index: number, block: RenderedBlock, labels: BlockLabels) {
+   const current = container.children[index]
+   if (block.mode === "code") {
+     updateCodeBlock(container, current, block, labels)
+     return
+   }
++  if (block.mode === "svg") {
++    updateSvgBlock(container, current, block, labels.svg)
++    return
++  }
+   if (
+     current instanceof HTMLDivElement &&
+     current.dataset.markdownKey === block.key &&
+@@ -605,7 +674,7 @@ function updateBlock(container: HTMLDivElement, index: number, block: RenderedBl
+   next.dataset.markdownHash = block.hash
+   next.style.display = "contents"
+   next.innerHTML = block.html
+-  decorate(next, labels)
++  decorate(next, labels, block.mode === "live")
+ 
+   if (!(current instanceof HTMLDivElement)) {
+     container.appendChild(next)
+@@ -622,16 +691,57 @@ function updateBlock(container: HTMLDivElement, index: number, block: RenderedBl
+       ) {
+         return false
+       }
++      // Keep the mounted diagram; hydrateSvgHosts pushes the new source into it.
++      if (isSvgHost(fromEl) && isSvgHost(toEl)) {
++        fromEl.dataset.svgSource = toEl.dataset.svgSource ?? ""
++        if (toEl.dataset.svgLive) fromEl.dataset.svgLive = toEl.dataset.svgLive
++        else delete fromEl.dataset.svgLive
++        return false
++      }
++      if (isSvgHost(fromEl)) disposeSvgHosts(fromEl)
+       if (fromEl.isEqualNode(toEl)) return false
+       return true
+     },
+     onBeforeNodeDiscarded: (node) => {
+-      if (node instanceof Element) disposeCopyButtons(node)
++      if (node instanceof Element) disposeWidgets(node)
+       return true
+     },
+   })
+ }
+ 
++function updateSvgBlock(
++  container: HTMLDivElement,
++  current: Element | undefined,
++  block: Extract<RenderedBlock, { mode: "svg" }>,
++  labels: SvgLabels,
++) {
++  const props = { source: block.source, complete: block.complete, labels }
++  const existing = current instanceof HTMLDivElement && current.dataset.markdownKey === block.key ? current : undefined
++  const mounted = existing?.firstElementChild
++  if (existing && mounted && isSvgHost(mounted)) {
++    existing.dataset.markdownHash = block.hash
++    existing.dataset.markdownComplete = block.complete ? "true" : "false"
++    updateSvgHost(mounted, props)
++    return
++  }
++
++  const next = document.createElement("div")
++  next.dataset.markdownBlock = ""
++  next.dataset.markdownKey = block.key
++  next.dataset.markdownHash = block.hash
++  next.dataset.markdownComplete = block.complete ? "true" : "false"
++  next.style.display = "contents"
++  const host = createSvgHost()
++  next.appendChild(host)
++  if (current) {
++    disposeWidgets(current)
++    current.replaceWith(next)
++  } else {
++    container.appendChild(next)
++  }
++  updateSvgHost(host, props)
++}
++
+ function updateCodeBlock(
+   container: HTMLDivElement,
+   current: Element | undefined,
+@@ -646,7 +756,7 @@ function updateCodeBlock(
+   next.dataset.markdownComplete = block.complete ? "true" : "false"
+   next.style.display = "contents"
+ 
+-  const code = existing?.querySelector("code")
++  const code = existing?.querySelector('[data-component="markdown-code"] code')
+   if (code instanceof HTMLElement) {
+     const wrapper = code.closest('[data-component="markdown-code"]')
+     if (wrapper instanceof HTMLElement) applyCodeMetadata(wrapper, block.language)
+@@ -698,7 +808,7 @@ function updateCodeBlock(
+     raw: block.raw,
+   })
+   if (current) {
+-    disposeCopyButtons(current)
++    disposeWidgets(current)
+     current.replaceWith(next)
+     return
+   }
+diff --git a/packages/ui/src/context/marked-parser.test.ts b/packages/ui/src/context/marked-parser.test.ts
+index 3c79e0a..b72eeeb 100644
+--- a/packages/ui/src/context/marked-parser.test.ts
++++ b/packages/ui/src/context/marked-parser.test.ts
+@@ -3,6 +3,12 @@ import { createMarkdownParser } from "./marked-parser"
+ 
+ const parser = createMarkdownParser((code, language) => `<pre data-language="${language}">${code}</pre>`)
+ 
++// KaTeX round-trips the original TeX into <annotation encoding="application/x-tex">, so it
++// has to be stripped before asserting that no raw TeX leaked into the visible transcript.
++function visible(html: string) {
++  return html.replace(/<annotation[^>]*>[\s\S]*?<\/annotation>/g, "")
++}
++
+ test("renders links with application attributes", async () => {
+   expect(await parser.parse("[OpenCode](https://opencode.ai)")).toBe(
+     '<p><a href="https://opencode.ai" class="external-link" target="_blank" rel="noopener noreferrer">OpenCode</a></p>\n',
+@@ -14,6 +20,62 @@ test("renders inline and block math", async () => {
+   expect(await parser.parse("$$\nx^2\n$$\n")).toContain('<span class="katex-display">')
+ })
+ 
++test("renders bracket-delimited display math", async () => {
++  expect(await parser.parse("\\[x^2\\]")).toContain('<span class="katex-display">')
++  expect(await parser.parse("\\[\nx^2\n\\]\n")).toContain('<span class="katex-display">')
++})
++
++test("renders display math that models emit mid-sentence", async () => {
++  const html = await parser.parse("Each term contains \\[u\\left(t-k+\\frac12\\right)\\] and stops there.")
++  expect(html).toContain('<span class="katex-display">')
++  expect(visible(html)).not.toContain("\\left")
++  expect(visible(html)).not.toContain("\\frac12")
++  expect(visible(html)).not.toContain("[")
++  expect(html).toContain("and stops there.")
++})
++
++test("keeps control sequences from closing a math span early", async () => {
++  const html = await parser.parse("\\[\\left[a\\right] + \\left(b\\right)\\]")
++  expect(html).toContain('<span class="katex-display">')
++  expect(visible(html)).not.toContain("\\right")
++  // A single annotation holding the whole expression proves it was not split at `\right]`.
++  expect(html).toContain(">\\left[a\\right] + \\left(b\\right)</annotation>")
++})
++
++test("renders inline math that wraps across a source line", async () => {
++  const html = await parser.parse("value \\(a +\nb\\) end")
++  expect(html).toContain('<span class="katex">')
++  expect(visible(html)).not.toContain("\\(")
++})
++
++test("renders single-line display math", async () => {
++  expect(await parser.parse("$$x^2$$")).toContain('<span class="katex-display">')
++})
++
++test("leaves escaped brackets alone when they are not math", async () => {
++  expect(await parser.parse("a \\[ b")).not.toContain("katex")
++  expect(await parser.parse("first \\[\n\nsecond\\] third")).not.toContain("katex")
++})
++
++test("does not treat escaped brackets inside inline code as math", async () => {
++  const html = await parser.parse("use `\\[x\\]` here")
++  expect(html).not.toContain("katex")
++  expect(html).toContain("<code>")
++})
++
++test("marks svg fences for diagram rendering instead of highlighting them", async () => {
++  let highlighted = false
++  const marked = createMarkdownParser(() => {
++    highlighted = true
++    return "<pre></pre>"
++  })
++  const html = await marked.parse('```svg\n<svg viewBox="0 0 1 1"><text>a & b</text></svg>\n```\n')
++  expect(html).toBe(
++    '<pre data-markdown-svg=""><code class="language-svg">&lt;svg viewBox=&quot;0 0 1 1&quot;&gt;&lt;text&gt;a &amp; b&lt;/text&gt;&lt;/svg&gt;</code></pre>\n',
++  )
++  expect(highlighted).toBe(false)
++})
++
+ test("uses the configured code highlighter", async () => {
+   expect(await parser.parse("```ts\nconst value = 1\n```\n")).toBe('<pre data-language="ts">const value = 1</pre>\n')
+ })
+diff --git a/packages/ui/src/context/marked-parser.tsx b/packages/ui/src/context/marked-parser.tsx
+index 71e4835..601a14c 100644
+--- a/packages/ui/src/context/marked-parser.tsx
++++ b/packages/ui/src/context/marked-parser.tsx
+@@ -13,47 +13,97 @@ export function createMarkdownParser(highlight: (code: string, language: string)
+       },
+     },
+     katexExtension,
+-    markedShiki({ highlight }),
++    markedShiki({
++      highlight: (code, language) =>
++        language.toLowerCase() === "svg" ? svgCodeBlock(code) : highlight(code, language),
++    }),
+   )
+ }
+ 
+-const inlineMathRegex = /^\\\(((?:\\.|[^\\\n])*?)\\\)/
+-const blockMathRegex = /^\$\$\n([\s\S]+?)\n\$\$(?:\n|$)/
++function escapeHtml(text: string) {
++  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")
++}
++
++// ```svg fences are marked for the transcript to render as a diagram. Anything that does not
++// know about the marker still shows an ordinary (unhighlighted) code block.
++function svgCodeBlock(code: string) {
++  return `<pre data-markdown-svg=""><code class="language-svg">${escapeHtml(code)}</code></pre>`
++}
++
++// A math body is any run that does not contain the closing delimiter. The `\\[\s\S]`
++// branch consumes a control sequence whole, so `\left(`, `\right]` and `\\` cannot close
++// the span early, while the lazy quantifier still stops at the first real delimiter.
++const inlineParenRegex = /^\\\(((?:\\[\s\S]|[^\\])+?)\\\)/
++const inlineBracketRegex = /^\\\[((?:\\[\s\S]|[^\\])+?)\\\]/
++const blockBracketRegex = /^[ \t]*\\\[((?:\\[\s\S]|[^\\])+?)\\\][ \t]*(?:\n+|$)/
++const blockDollarRegex = /^[ \t]*\$\$([\s\S]+?)\$\$[ \t]*(?:\n+|$)/
++
++// Math never spans a blank line. Bailing out keeps an unmatched `\[` from swallowing the
++// rest of the document while a response is still streaming in.
++function mathToken(type: string, displayMode: boolean, match: RegExpMatchArray | null) {
++  if (!match) return undefined
++  const text = match[1].trim()
++  if (!text || /\n[ \t]*\n/.test(match[1])) return undefined
++  return { type, raw: match[0], text, displayMode }
++}
++
++function startAt(src: string, delimiter: string) {
++  const index = src.indexOf(delimiter)
++  if (index === -1) return undefined
++  return index
++}
++
++const blockMathExtensions = [
++  {
++    name: "blockKatexBracket",
++    level: "block" as const,
++    tokenizer(src: string) {
++      return mathToken("blockKatexBracket", true, src.match(blockBracketRegex))
++    },
++    renderer: renderKatexToken,
++  },
++  {
++    name: "blockKatex",
++    level: "block" as const,
++    tokenizer(src: string) {
++      return mathToken("blockKatex", true, src.match(blockDollarRegex))
++    },
++    renderer: renderKatexToken,
++  },
++]
++
++/**
++ * Block-level math tokenizers on their own. Anything that splits markdown into blocks
++ * (e.g. the streaming projector) must use these, otherwise lines inside a display-math
++ * block that start with `+`, `-` or `1.` get lexed as lists and the block is torn apart.
++ */
++export const mathBlockExtension: MarkedExtension = { extensions: blockMathExtensions }
+ 
+ const katexExtension: MarkedExtension = {
+   extensions: [
++    ...blockMathExtensions,
+     {
+       name: "inlineKatex",
+       level: "inline",
+       start(src) {
+-        const index = src.indexOf("\\(")
+-        if (index === -1) return
+-        return index
++        return startAt(src, "\\(")
+       },
+       tokenizer(src) {
+-        const match = src.match(inlineMathRegex)
+-        if (!match) return
+-        return {
+-          type: "inlineKatex",
+-          raw: match[0],
+-          text: match[1].trim(),
+-          displayMode: false,
+-        }
++        return mathToken("inlineKatex", false, src.match(inlineParenRegex))
+       },
+       renderer: renderKatexToken,
+     },
+     {
+-      name: "blockKatex",
+-      level: "block",
++      // `\[ ... \]` is display math, but models routinely emit it mid-sentence, so it has
++      // to be tokenized inline as well. Without this marked's escape rule turns the
++      // delimiters into literal brackets and leaks the raw TeX into the transcript.
++      name: "inlineKatexBracket",
++      level: "inline",
++      start(src) {
++        return startAt(src, "\\[")
++      },
+       tokenizer(src) {
+-        const match = src.match(blockMathRegex)
+-        if (!match) return
+-        return {
+-          type: "blockKatex",
+-          raw: match[0],
+-          text: match[1].trim(),
+-          displayMode: true,
+-        }
++        return mathToken("inlineKatexBracket", true, src.match(inlineBracketRegex))
+       },
+       renderer: renderKatexToken,
+     },
+-- 
+2.54.0.windows.1
+
