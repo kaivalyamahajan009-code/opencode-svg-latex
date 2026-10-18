@@ -20,6 +20,48 @@ test("renders inline and block math", async () => {
   expect(await parser.parse("$$\nx^2\n$$\n")).toContain('<span class="katex-display">')
 })
 
+test("renders dollar-delimited inline math from the Fourier response", async () => {
+  const html = await parser.parse(
+    "Also, for integer $n$: the impulses at $0,\\pm2\\pi,\\pm4\\pi,\\ldots$ lie in $[-\\pi,\\pi]$.",
+  )
+  expect(html.match(/class="katex"/g)).toHaveLength(3)
+  expect(visible(html)).not.toContain("$")
+  expect(visible(html)).not.toContain("\\pm")
+})
+
+test("keeps currency, escaped dollars, and code out of inline math", async () => {
+  for (const text of ["Pay $5 and $10.", "Pay $5.00 or $10.00.", "a $ spaced $ b", "\\$x\\$", "`$x$`"]) {
+    expect(await parser.parse(text)).not.toContain("katex")
+  }
+  const html = await parser.parse("Use $x_i + y_j$ and $\\text{cost: \\$5}$.")
+  expect(html.match(/class="katex"/g)).toHaveLength(2)
+  expect(html).not.toContain("katex-error")
+})
+
+test("starts display math after prose before setext headings and lists can split it", async () => {
+  for (const delimiters of [
+    ["\\[", "\\]"],
+    ["$$", "$$"],
+  ]) {
+    const html = await parser.parse(
+      `Because \\(u[n]=u_e[n]+u_o[n]\\),\n${delimiters[0]}\nU(e^{j\\Omega})\n=\n\\underbrace{\\frac12+\n\\frac{1+e^{-j\\Omega}}{2(1-e^{-j\\Omega})}}_{\\text{combine these fractions}}\n+\\pi\\sum_p\\delta(\\Omega-2\\pi p).\n${delimiters[1]}\n\nAfter`,
+    )
+    expect(html.match(/class="katex-display"/g)).toHaveLength(1)
+    expect(html).not.toContain("<h1>")
+    expect(html).not.toContain("<ul>")
+    expect(html).not.toContain("katex-error")
+    expect(visible(html)).not.toContain("\\underbrace")
+    expect(html).toContain("After")
+  }
+})
+
+test("preserves ordinary setext headings next to display math", async () => {
+  const html = await parser.parse("Heading\n=======\n\nBefore\n\\[\nx\n=\ny\n\\]\n\nAfter\n-----")
+  expect(html).toContain("<h1>Heading</h1>")
+  expect(html).toContain("<h2>After</h2>")
+  expect(html.match(/class="katex-display"/g)).toHaveLength(1)
+})
+
 test("renders bracket-delimited display math", async () => {
   expect(await parser.parse("\\[x^2\\]")).toContain('<span class="katex-display">')
   expect(await parser.parse("\\[\nx^2\n\\]\n")).toContain('<span class="katex-display">')

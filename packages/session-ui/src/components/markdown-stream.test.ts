@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { createMarkdownParser } from "@opencode-ai/ui/context/marked-parser"
 import { canReusePendingBlock } from "./markdown-projection"
 import { project, stream } from "./markdown-stream"
 
@@ -20,6 +21,35 @@ describe("markdown stream", () => {
     expect(blocks.map((block) => block.raw)).toEqual(["intro\n\n", math, "after"])
     const done = project(project(undefined, `intro\n\n${math}after`, true), `intro\n\n${math}after`, false)
     expect(done.blocks.map((block) => block.raw)).toEqual(["intro\n\n", math, "after"])
+  })
+
+  test("renders display math after prose throughout streaming and completion", async () => {
+    const parser = createMarkdownParser((code) => code)
+    for (const delimiters of [
+      ["\\[", "\\]"],
+      ["$$", "$$"],
+    ]) {
+      const text = `Because \\(u[n]=u_e[n]+u_o[n]\\),\n${delimiters[0]}\nU(e^{j\\Omega})\n=\n\\underbrace{\\frac12+\n\\frac{1+e^{-j\\Omega}}{2(1-e^{-j\\Omega})}}_{\\text{combine these fractions}}\n+\\pi\\sum_p\\delta(\\Omega-2\\pi p).\n${delimiters[1]}\n\nAfter`
+      let projection = project(undefined, "", true)
+      for (let end = 1; end <= text.length; end++) {
+        projection = project(projection, text.slice(0, end), true)
+      }
+      const done = project(projection, text, false)
+      for (const current of [projection, done]) {
+        const html = (await Promise.all(current.blocks.map((block) => parser.parse(block.src)))).join("")
+        expect(html.match(/class="katex-display"/g)).toHaveLength(1)
+        expect(html).not.toContain("<h1>")
+        expect(html).not.toContain("katex-error")
+        expect(html).toContain("After")
+      }
+    }
+  })
+
+  test("does not repair TeX subscripts as Markdown emphasis in a closed live math block", async () => {
+    const text = "\\[\n\\sum_{n=0}^N x_n\n\\]"
+    const block = stream(text, true)[0]!
+    expect(block.src).toBe(text)
+    expect(await createMarkdownParser((code) => code).parse(block.src)).toContain('class="katex-display"')
   })
 
   test("splits an unfinished trailing code fence from stable content", () => {

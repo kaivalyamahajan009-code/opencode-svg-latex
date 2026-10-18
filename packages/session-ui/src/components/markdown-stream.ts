@@ -81,7 +81,12 @@ export function stream(text: string, live: boolean): Block[] {
     .slice(tail)
     .map((token) => token.raw)
     .join("")
-  if (last.type !== "code") return [...result, { raw, src: heal(raw), mode: "live" }]
+  if (last.type !== "code") {
+    // Complete math is already balanced; remend mistakes TeX subscripts for emphasis
+    // and can append an underscore after '\]', invalidating the display delimiter.
+    const math = last.type === "blockKatex" || last.type === "blockKatexBracket"
+    return [...result, { raw, src: math ? raw : heal(raw), mode: "live" }]
+  }
 
   const code = last as Tokens.Code
   if (!open(code.raw))

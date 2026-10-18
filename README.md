@@ -4,19 +4,20 @@ Changes to the [opencode](https://github.com/anomalyco/opencode) desktop app's c
 
 - **Inline SVG diagrams.** Fenced ` ```svg ` blocks in assistant replies render as diagrams instead of code.
 - **Loading animation.** While a diagram is still streaming, a card shows opencode's grid progress indicator next to the diagram's `<title>`.
-- **LaTeX fixes.** `\[ … \]` display math renders (even mid-sentence), `\( … \)` can wrap across lines, `$$ … $$` works on one line, and display math is no longer split into list items while a reply streams.
+- **LaTeX fixes.** `$ … $` inline math renders with safeguards for currency, escaped dollars, and code. `\[ … \]` display math renders (even mid-sentence), `\( … \)` can wrap across lines, and `$$ … $$` works on one line. Display equations immediately after prose stay intact even when an equation contains a standalone `=` or list-like lines, and complete streamed math is protected from Markdown repair that mistakes TeX subscripts for emphasis.
 
 This repository contains only the changed files, not a runnable copy of opencode.
 
 ## Applying the changes
 
-The patch was made against opencode commit `f5ce4f8` (desktop version 1.18.31).
+The original patch was made against opencode commit `f5ce4f8` (desktop version 1.18.31). Apply the follow-up LaTeX patch after it:
 
 ```sh
 git clone https://github.com/anomalyco/opencode.git
 cd opencode
 git checkout f5ce4f8
 git am /path/to/opencode-svg-latex.patch
+git am /path/to/0001-fix-app-correct-inline-and-streamed-latex-rendering.patch
 ```
 
 On newer opencode versions the patch may need small conflict fixes. The files under `packages/` show the final version of every changed file at the same paths as in opencode.
@@ -33,7 +34,14 @@ On newer opencode versions the patch may need small conflict fixes. The files un
 | `packages/ui/src/context/marked-parser.tsx` | LaTeX delimiter tokenizers and the ` ```svg ` marker |
 | `packages/opencode/src/session/system.ts`, `prompt.ts` | Tells the model it may answer with ` ```svg ` when running in the desktop app |
 | `*.test.ts`, `markdown.stories.tsx` | Tests and Storybook demos (rendered, streaming, broken and hostile diagrams) |
-| `opencode-svg-latex.patch` | The whole change as a single `git am` patch |
+| `opencode-svg-latex.patch` | The original SVG and LaTeX changes as a `git am` patch |
+| `0001-fix-app-correct-inline-and-streamed-latex-rendering.patch` | Follow-up inline-dollar, display-boundary, and streaming-repair fixes |
+
+## LaTeX regression verification
+
+The follow-up fixes were verified in the full OpenCode workspace with 59 targeted Markdown tests and type checking in both `packages/ui` and `packages/session-ui`. Regressions cover the recovered Fourier-response examples, character-by-character streaming followed by completion, ordinary setext headings, currency, escaped dollars, and inline code.
+
+This repository is a source-and-patch bundle. Applying the patches does not update an already-running desktop binary; rebuild and relaunch the desktop app to use the changes.
 
 ## Security
 

@@ -1,0 +1,207 @@
+From 059453a51717415e615f90d824b6e0e927873d81 Mon Sep 17 00:00:00 2001
+From: kaivalyamahajan009-code
+ <307739818+kaivalyamahajan009-code@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 23:22:03 +0530
+Subject: [PATCH] fix(app): correct inline and streamed latex rendering
+
+---
+ .../src/components/markdown-stream.test.ts    | 30 +++++++++++++
+ .../src/components/markdown-stream.ts         |  7 +++-
+ packages/ui/src/context/marked-parser.test.ts | 42 +++++++++++++++++++
+ packages/ui/src/context/marked-parser.tsx     | 41 +++++++++++++++++-
+ 4 files changed, 118 insertions(+), 2 deletions(-)
+
+diff --git a/packages/session-ui/src/components/markdown-stream.test.ts b/packages/session-ui/src/components/markdown-stream.test.ts
+index fe4ad7e0b..c774e61c4 100644
+--- a/packages/session-ui/src/components/markdown-stream.test.ts
++++ b/packages/session-ui/src/components/markdown-stream.test.ts
+@@ -1,4 +1,5 @@
+ import { describe, expect, test } from "bun:test"
++import { createMarkdownParser } from "@opencode-ai/ui/context/marked-parser"
+ import { canReusePendingBlock } from "./markdown-projection"
+ import { project, stream } from "./markdown-stream"
+ 
+@@ -22,6 +23,35 @@ describe("markdown stream", () => {
+     expect(done.blocks.map((block) => block.raw)).toEqual(["intro\n\n", math, "after"])
+   })
+ 
++  test("renders display math after prose throughout streaming and completion", async () => {
++    const parser = createMarkdownParser((code) => code)
++    for (const delimiters of [
++      ["\\[", "\\]"],
++      ["$$", "$$"],
++    ]) {
++      const text = `Because \\(u[n]=u_e[n]+u_o[n]\\),\n${delimiters[0]}\nU(e^{j\\Omega})\n=\n\\underbrace{\\frac12+\n\\frac{1+e^{-j\\Omega}}{2(1-e^{-j\\Omega})}}_{\\text{combine these fractions}}\n+\\pi\\sum_p\\delta(\\Omega-2\\pi p).\n${delimiters[1]}\n\nAfter`
++      let projection = project(undefined, "", true)
++      for (let end = 1; end <= text.length; end++) {
++        projection = project(projection, text.slice(0, end), true)
++      }
++      const done = project(projection, text, false)
++      for (const current of [projection, done]) {
++        const html = (await Promise.all(current.blocks.map((block) => parser.parse(block.src)))).join("")
++        expect(html.match(/class="katex-display"/g)).toHaveLength(1)
++        expect(html).not.toContain("<h1>")
++        expect(html).not.toContain("katex-error")
++        expect(html).toContain("After")
++      }
++    }
++  })
++
++  test("does not repair TeX subscripts as Markdown emphasis in a closed live math block", async () => {
++    const text = "\\[\n\\sum_{n=0}^N x_n\n\\]"
++    const block = stream(text, true)[0]!
++    expect(block.src).toBe(text)
++    expect(await createMarkdownParser((code) => code).parse(block.src)).toContain('class="katex-display"')
++  })
++
+   test("splits an unfinished trailing code fence from stable content", () => {
+     expect(stream("before\n\n```ts\nconst x = 1", true)).toEqual([
+       { raw: "before\n\n", src: "before\n\n", mode: "full" },
+diff --git a/packages/session-ui/src/components/markdown-stream.ts b/packages/session-ui/src/components/markdown-stream.ts
+index bef1de7b9..a9864e974 100644
+--- a/packages/session-ui/src/components/markdown-stream.ts
++++ b/packages/session-ui/src/components/markdown-stream.ts
+@@ -81,7 +81,12 @@ export function stream(text: string, live: boolean): Block[] {
+     .slice(tail)
+     .map((token) => token.raw)
+     .join("")
+-  if (last.type !== "code") return [...result, { raw, src: heal(raw), mode: "live" }]
++  if (last.type !== "code") {
++    // Complete math is already balanced; remend mistakes TeX subscripts for emphasis
++    // and can append an underscore after '\]', invalidating the display delimiter.
++    const math = last.type === "blockKatex" || last.type === "blockKatexBracket"
++    return [...result, { raw, src: math ? raw : heal(raw), mode: "live" }]
++  }
+ 
+   const code = last as Tokens.Code
+   if (!open(code.raw))
+diff --git a/packages/ui/src/context/marked-parser.test.ts b/packages/ui/src/context/marked-parser.test.ts
+index b72eeeb51..c11646eac 100644
+--- a/packages/ui/src/context/marked-parser.test.ts
++++ b/packages/ui/src/context/marked-parser.test.ts
+@@ -20,6 +20,48 @@ test("renders inline and block math", async () => {
+   expect(await parser.parse("$$\nx^2\n$$\n")).toContain('<span class="katex-display">')
+ })
+ 
++test("renders dollar-delimited inline math from the Fourier response", async () => {
++  const html = await parser.parse(
++    "Also, for integer $n$: the impulses at $0,\\pm2\\pi,\\pm4\\pi,\\ldots$ lie in $[-\\pi,\\pi]$.",
++  )
++  expect(html.match(/class="katex"/g)).toHaveLength(3)
++  expect(visible(html)).not.toContain("$")
++  expect(visible(html)).not.toContain("\\pm")
++})
++
++test("keeps currency, escaped dollars, and code out of inline math", async () => {
++  for (const text of ["Pay $5 and $10.", "Pay $5.00 or $10.00.", "a $ spaced $ b", "\\$x\\$", "`$x$`"]) {
++    expect(await parser.parse(text)).not.toContain("katex")
++  }
++  const html = await parser.parse("Use $x_i + y_j$ and $\\text{cost: \\$5}$.")
++  expect(html.match(/class="katex"/g)).toHaveLength(2)
++  expect(html).not.toContain("katex-error")
++})
++
++test("starts display math after prose before setext headings and lists can split it", async () => {
++  for (const delimiters of [
++    ["\\[", "\\]"],
++    ["$$", "$$"],
++  ]) {
++    const html = await parser.parse(
++      `Because \\(u[n]=u_e[n]+u_o[n]\\),\n${delimiters[0]}\nU(e^{j\\Omega})\n=\n\\underbrace{\\frac12+\n\\frac{1+e^{-j\\Omega}}{2(1-e^{-j\\Omega})}}_{\\text{combine these fractions}}\n+\\pi\\sum_p\\delta(\\Omega-2\\pi p).\n${delimiters[1]}\n\nAfter`,
++    )
++    expect(html.match(/class="katex-display"/g)).toHaveLength(1)
++    expect(html).not.toContain("<h1>")
++    expect(html).not.toContain("<ul>")
++    expect(html).not.toContain("katex-error")
++    expect(visible(html)).not.toContain("\\underbrace")
++    expect(html).toContain("After")
++  }
++})
++
++test("preserves ordinary setext headings next to display math", async () => {
++  const html = await parser.parse("Heading\n=======\n\nBefore\n\\[\nx\n=\ny\n\\]\n\nAfter\n-----")
++  expect(html).toContain("<h1>Heading</h1>")
++  expect(html).toContain("<h2>After</h2>")
++  expect(html.match(/class="katex-display"/g)).toHaveLength(1)
++})
++
+ test("renders bracket-delimited display math", async () => {
+   expect(await parser.parse("\\[x^2\\]")).toContain('<span class="katex-display">')
+   expect(await parser.parse("\\[\nx^2\n\\]\n")).toContain('<span class="katex-display">')
+diff --git a/packages/ui/src/context/marked-parser.tsx b/packages/ui/src/context/marked-parser.tsx
+index 601a14ce9..501114c0c 100644
+--- a/packages/ui/src/context/marked-parser.tsx
++++ b/packages/ui/src/context/marked-parser.tsx
+@@ -35,6 +35,7 @@ function svgCodeBlock(code: string) {
+ // the span early, while the lazy quantifier still stops at the first real delimiter.
+ const inlineParenRegex = /^\\\(((?:\\[\s\S]|[^\\])+?)\\\)/
+ const inlineBracketRegex = /^\\\[((?:\\[\s\S]|[^\\])+?)\\\]/
++const inlineDollarRegex = /^\$(?![\s$])((?:\\[\s\S]|[^\\$])+?)\$(?![\d$])/
+ const blockBracketRegex = /^[ \t]*\\\[((?:\\[\s\S]|[^\\])+?)\\\][ \t]*(?:\n+|$)/
+ const blockDollarRegex = /^[ \t]*\$\$([\s\S]+?)\$\$[ \t]*(?:\n+|$)/
+ 
+@@ -53,10 +54,19 @@ function startAt(src: string, delimiter: string) {
+   return index
+ }
+ 
++function mathBlockStart(src: string) {
++  for (const match of src.matchAll(/^[ \t]*(?:\\\[|\$\$)/gm)) {
++    const rest = src.slice(match.index)
++    if (mathToken("", true, rest.match(blockBracketRegex) ?? rest.match(blockDollarRegex))) return match.index
++  }
++  return undefined
++}
++
+ const blockMathExtensions = [
+   {
+     name: "blockKatexBracket",
+     level: "block" as const,
++    start: mathBlockStart,
+     tokenizer(src: string) {
+       return mathToken("blockKatexBracket", true, src.match(blockBracketRegex))
+     },
+@@ -77,11 +87,40 @@ const blockMathExtensions = [
+  * (e.g. the streaming projector) must use these, otherwise lines inside a display-math
+  * block that start with `+`, `-` or `1.` get lexed as lists and the block is torn apart.
+  */
+-export const mathBlockExtension: MarkedExtension = { extensions: blockMathExtensions }
++export const mathBlockExtension: MarkedExtension = {
++  extensions: blockMathExtensions,
++  tokenizer: {
++    lheading(src) {
++      // Marked checks setext headings before extension start hints. An '=' inside math
++      // must not turn all the preceding prose and the opening delimiter into a heading.
++      const heading = this.rules.block.lheading.exec(src)
++      if (!heading) return false
++      const start = mathBlockStart(src)
++      if (start !== undefined && start < heading[0].length) return undefined
++      return false
++    },
++  },
++}
+ 
+ const katexExtension: MarkedExtension = {
++  ...mathBlockExtension,
+   extensions: [
+     ...blockMathExtensions,
++    {
++      name: "inlineKatexDollar",
++      level: "inline",
++      start(src) {
++        return startAt(src, "$")
++      },
++      tokenizer(src) {
++        const match = src.match(inlineDollarRegex)
++        // Whitespace at either boundary and a closing dollar followed by a digit are
++        // currency/prose, while escaped dollars inside a math body remain valid TeX.
++        if (match && /\s$/.test(match[1])) return undefined
++        return mathToken("inlineKatexDollar", false, match)
++      },
++      renderer: renderKatexToken,
++    },
+     {
+       name: "inlineKatex",
+       level: "inline",
+-- 
+2.54.0.windows.1
+

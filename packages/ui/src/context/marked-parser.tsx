@@ -35,6 +35,7 @@ function svgCodeBlock(code: string) {
 // the span early, while the lazy quantifier still stops at the first real delimiter.
 const inlineParenRegex = /^\\\(((?:\\[\s\S]|[^\\])+?)\\\)/
 const inlineBracketRegex = /^\\\[((?:\\[\s\S]|[^\\])+?)\\\]/
+const inlineDollarRegex = /^\$(?![\s$])((?:\\[\s\S]|[^\\$])+?)\$(?![\d$])/
 const blockBracketRegex = /^[ \t]*\\\[((?:\\[\s\S]|[^\\])+?)\\\][ \t]*(?:\n+|$)/
 const blockDollarRegex = /^[ \t]*\$\$([\s\S]+?)\$\$[ \t]*(?:\n+|$)/
 
@@ -53,10 +54,19 @@ function startAt(src: string, delimiter: string) {
   return index
 }
 
+function mathBlockStart(src: string) {
+  for (const match of src.matchAll(/^[ \t]*(?:\\\[|\$\$)/gm)) {
+    const rest = src.slice(match.index)
+    if (mathToken("", true, rest.match(blockBracketRegex) ?? rest.match(blockDollarRegex))) return match.index
+  }
+  return undefined
+}
+
 const blockMathExtensions = [
   {
     name: "blockKatexBracket",
     level: "block" as const,
+    start: mathBlockStart,
     tokenizer(src: string) {
       return mathToken("blockKatexBracket", true, src.match(blockBracketRegex))
     },
@@ -77,11 +87,40 @@ const blockMathExtensions = [
  * (e.g. the streaming projector) must use these, otherwise lines inside a display-math
  * block that start with `+`, `-` or `1.` get lexed as lists and the block is torn apart.
  */
-export const mathBlockExtension: MarkedExtension = { extensions: blockMathExtensions }
+export const mathBlockExtension: MarkedExtension = {
+  extensions: blockMathExtensions,
+  tokenizer: {
+    lheading(src) {
+      // Marked checks setext headings before extension start hints. An '=' inside math
+      // must not turn all the preceding prose and the opening delimiter into a heading.
+      const heading = this.rules.block.lheading.exec(src)
+      if (!heading) return false
+      const start = mathBlockStart(src)
+      if (start !== undefined && start < heading[0].length) return undefined
+      return false
+    },
+  },
+}
 
 const katexExtension: MarkedExtension = {
+  ...mathBlockExtension,
   extensions: [
     ...blockMathExtensions,
+    {
+      name: "inlineKatexDollar",
+      level: "inline",
+      start(src) {
+        return startAt(src, "$")
+      },
+      tokenizer(src) {
+        const match = src.match(inlineDollarRegex)
+        // Whitespace at either boundary and a closing dollar followed by a digit are
+        // currency/prose, while escaped dollars inside a math body remain valid TeX.
+        if (match && /\s$/.test(match[1])) return undefined
+        return mathToken("inlineKatexDollar", false, match)
+      },
+      renderer: renderKatexToken,
+    },
     {
       name: "inlineKatex",
       level: "inline",
